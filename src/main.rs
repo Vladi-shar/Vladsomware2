@@ -29,7 +29,7 @@ struct VladsomwareApp {
     encryptor: Encryptor,
     recursive: bool,
     verbose: bool,
-
+    random_order: bool,
     encrypt_tex: TextureHandle,
     decrypt_tex: TextureHandle,
 
@@ -64,6 +64,7 @@ impl VladsomwareApp {
             encryptor: Encryptor::new().unwrap(),
             recursive: false,
             verbose: false,
+            random_order: false,
             encrypt_tex: icon_texture_from_icon_data(
                 &cc.egui_ctx,
                 "encrypt_icon_tex",
@@ -256,6 +257,14 @@ impl VladsomwareApp {
                         debug!("Verbose logging enabled");
                     }
                 }
+
+                rec_response = ui
+                    .checkbox(&mut self.random_order, "Random order")
+                    .on_hover_text("Encrypt files in a random order");
+                if rec_response.changed() {
+                    self.encryptor.set_random_order(self.random_order);
+                    debug!("Random order: {}", self.random_order);
+                }
                 ui.add_space(10.0);
             });
         })
@@ -438,7 +447,7 @@ impl App for VladsomwareApp {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut viewport_builder = ViewportBuilder::default()
-        .with_inner_size([400.0, 550.0])
+        .with_inner_size([400.0, 560.0])
         .with_resizable(false);
     if let Some(icon) = load_icon_safe(include_bytes!("../rsrc/vladsomware.png")) {
         viewport_builder = viewport_builder.with_icon(icon);

